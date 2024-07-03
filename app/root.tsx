@@ -1,0 +1,354 @@
+import { TooltipProvider } from "@radix-ui/react-tooltip";
+import { ShopifyScripts } from "@shopify/hydrogen/react";
+import type { WeaverseImage } from "@weaverse/hydrogen/react-router";
+import {
+  useThemeSettings,
+  withWeaverse,
+} from "@weaverse/hydrogen/react-router";
+import { type CSSProperties, useEffect } from "react";
+import type { LinksFunction, LoaderFunctionArgs, MetaArgs } from "react-router";
+import {
+  data as routeData,
+  isRouteErrorResponse,
+  Links,
+  Meta,
+  Outlet,
+  Scripts,
+  ScrollRestoration,
+  useLocation,
+  useNavigate,
+  useRouteError,
+  useRouteLoaderData,
+} from "react-router";
+import { useLegacyThemeText } from "~/hooks/use-legacy-theme-text";
+import type { ThemeSettings } from "~/types/weaverse";
+import { getSeoMeta, type SeoConfig } from "~/utils/seo-meta";
+import { loadCriticalData, loadDeferredData } from "./.server/root";
+import { CartProvider } from "./components/cart/cart-store";
+import { IconSprite } from "./components/icon-sprite";
+import { Footer } from "./components/layout/footer";
+import { Header } from "./components/layout/header";
+import {
+  hasVisibleAnnouncement,
+  ScrollingAnnouncement,
+} from "./components/layout/scrolling-announcement";
+import { PwaInstallHint } from "./components/pwa-install-hint";
+import { CartAnalytics, PageView } from "./components/root/analytics-views";
+import { CustomAnalytics } from "./components/root/custom-analytics";
+import { GenericError, WeaverseFailure } from "./components/root/generic-error";
+import { GlobalLoading } from "./components/root/global-loading";
+import {
+  NewsletterPopup,
+  useShouldRenderNewsletterPopup,
+} from "./components/root/newsletter-popup";
+import { NotFound } from "./components/root/not-found";
+import { ShopifyInbox, ShopifyInboxLauncher } from "./components/shopify-inbox";
+import styles from "./styles/app.css?url";
+import { rootHeaders } from "./utils/cache";
+import { getPublicEnv } from "./utils/env";
+import { DEFAULT_LOCALE } from "./utils/locale";
+import { cdnSize } from "./utils/pwa";
+import { routeTemplates } from "./utils/route-templates";
+import { syncShopifyMarket } from "./utils/shopify";
+import {
+  DEGRADED_HEADERS,
+  type WeaverseRouteFailure,
+} from "./weaverse/load-failure";
+import { GlobalStyle } from "./weaverse/style";
+
+export type RootLoader = typeof loader;
+
+export const links: LinksFunction = () => {
+  return [
+    {
+      rel: "preconnect",
+      href: "https://cdn.shopify.com",
+    },
+    {
+      rel: "preconnect",
+      href: "https://shop.app",
+    },
+    {
+      rel: "preconnect",
+      href: "https://www.googletagmanager.com",
+    },
+    { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+  ];
+};
+
+export async function loader(args: LoaderFunctionArgs) {
+  // Start fetching non-critical data without blocking time to first byte
+  const deferredData = loadDeferredData(args);
+
+  // Await the critical data required to render initial state of the page
+  const criticalData = await loadCriticalData(args);
+
+  // Rendered without the merchant's theme settings: shown, but never cached.
+  return routeData(
+    {
+      ...deferredData,
+      ...criticalData,
+      publicEnv: getPublicEnv(args.context.env),
+    },
+    criticalData.themeUnavailable ? { headers: DEGRADED_HEADERS } : undefined,
+  );
+}
+
+export const headers = rootHeaders;
+
+export const meta = ({ data }: MetaArgs<typeof loader>) => {
+  const meta = getSeoMeta(data?.seo as SeoConfig);
+    // The demo store's SEO title carries the original theme name; every shipped title is ours.
+    return meta.map((entry) => {
+      const copy = { ...entry } as Record<string, unknown>;
+      for (const key of ["title", "description", "name"]) {
+        const value = copy[key];
+        if (typeof value === "string") {
+          copy[key] = value
+            .replace(/\s*\|\s*Weaverse .*$/i, "")
+            .replace(/Weaverse Shopify Hydrogen Demo/gi, "Kestrel")
+            .replace(/Weaverse/gi, "Kestrel");
+        }
+      }
+      return copy as (typeof meta)[number];
+    });
+};
+
+function App() {
+  return <Outlet />;
+}
+
+export function ErrorBoundary({ error }: { error: Error }) {
+  const routeError: { status?: number; data?: any } = useRouteError();
+  const isRouteError = isRouteErrorResponse(routeError);
+
+  let pageType = "page";
+
+  if (isRouteError && routeError.status === 404) {
+    pageType = routeError.data || pageType;
+  }
+
+  const weaverseFailure = isRouteError
+    ? (routeError.data as WeaverseRouteFailure | null)?.weaverseFailure
+    : undefined;
+  if (weaverseFailure) {
+    return <WeaverseFailure failure={weaverseFailure} />;
+  }
+
+  return isRouteError ? (
+    routeError.status === 404 ? (
+      <NotFound type={pageType} />
+    ) : (
+      <GenericError
+        error={{ message: `${routeError.status} ${routeError.data}` }}
+      />
+    )
+  ) : (
+    <GenericError error={error instanceof Error ? error : undefined} />
+  );
+}
+
+export const Layout = withWeaverse(function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const data = useRouteLoaderData<RootLoader>("root");
+  const publicEnv = data?.publicEnv;
+  const locale = data?.selectedLocale ?? DEFAULT_LOCALE;
+  useEffect(() => {
+    syncShopifyMarket(locale);
+  }, [locale]);
+  // Announcement copy is theme content, not a theme setting: it is translated
+  // per language in the Translation Manager. It must be read through the same
+  // legacy-aware reader `ScrollingAnnouncement` uses — a raw `t()` ignores a
+  // merchant's pre-migration `topbarText`, so the reserved height and the bar
+  // that renders into it would disagree and the header would jump on hydration.
+  const themeText = useLegacyThemeText();
+  const topbarText = themeText("announcement.topbarText");
+  const {
+    topbarHeight,
+    pwaEnabled,
+    pwaIcon,
+    pwaThemeColor,
+    shopifyChatPosition,
+    shopifyChatVerticalPosition,
+    shopifyChatColor,
+    shopifyChatStyle,
+    shopifyChatIcon,
+    shopifyChatText,
+    shopifyChatCustomButton,
+    shopifyChatCustomButtonLabel,
+  } = useThemeSettings<ThemeSettings>();
+  // App icon for iOS Add to Home Screen (iOS ignores manifest icons).
+  const pwaIconUrl =
+    (pwaIcon as WeaverseImage | undefined)?.url ||
+    data?.layout?.shop?.brand?.logo?.image?.url;
+  // Without any icon the manifest 404s (browsers won't install icon-less
+  // apps), so don't advertise the PWA at all until one exists.
+  const pwaActive = Boolean(pwaEnabled && pwaIconUrl);
+  const shouldShowNewsletterPopup = useShouldRenderNewsletterPopup();
+
+  // Bypass Weaverse theme layout for Hydrogen dev tools
+  // See: https://github.com/Weaverse/pilot/issues/321
+  if (
+    location.pathname === "/subrequest-profiler" ||
+    location.pathname === "/graphiql"
+  ) {
+    return children;
+  }
+
+  return (
+    <html lang={locale.hreflang} dir={locale.direction}>
+      <head>
+        <meta charSet="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        {/* storefront-banner.js reads the public token from this tag. */}
+        <script
+          id="shopify-features"
+          type="application/json"
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{
+            __html: JSON.stringify({
+              accessToken: data?.consent?.storefrontAccessToken ?? "",
+            }),
+          }}
+        />
+        {/*
+         * Shopify's runtime: the `window.Shopify` bootstrap, the analytics
+         * bus (`window.Shopify.analytics`), the consent/privacy banner,
+         * Shopify analytics and Standard Actions. Rendered first in the head
+         * so the bus exists before any route publishes, and so
+         * `window.Shopify` is created by plain assignment before the header
+         * lazy-loads account.js (which would otherwise define it as
+         * non-configurable). It starts once with its first props; the
+         * `syncShopifyMarket` effect above follows client-side market
+         * switches.
+         */}
+        {data ? (
+          <ShopifyScripts
+            shop={data.shopifyScripts.shop}
+            i18n={data.shopifyScripts.i18n}
+            analytics={{ channel: data.shopifyScripts.channel }}
+            shopifyAnalytics={data.shopifyScripts.shopifyAnalytics}
+            consent={{ mode: data.consent.mode }}
+            routes={routeTemplates}
+            navigate={navigate}
+          />
+        ) : null}
+        {pwaActive ? (
+          <>
+            <link rel="manifest" href="/manifest.webmanifest" />
+            <meta name="theme-color" content={pwaThemeColor || "#ffffff"} />
+            <link rel="apple-touch-icon" href={cdnSize(pwaIconUrl, 180)} />
+            <meta name="apple-mobile-web-app-capable" content="yes" />
+            <meta
+              name="apple-mobile-web-app-status-bar-style"
+              content="default"
+            />
+          </>
+        ) : null}
+        {/*
+         * SW registration lives here (not entry.client) because it depends on
+         * theme settings. When PWA is off, actively unregister so previously
+         * installed workers don't linger after a merchant disables the feature.
+         */}
+        <script
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{
+            __html: pwaActive
+              ? 'if("serviceWorker" in navigator){window.addEventListener("load",()=>navigator.serviceWorker.register("/sw.js"))}'
+              : // Only remove Pilot's own worker — merchants may run third-party SWs under other scopes.
+                'if("serviceWorker" in navigator){navigator.serviceWorker.getRegistrations().then((rs)=>rs.forEach((r)=>{const w=r.active||r.waiting||r.installing;if(w&&new URL(w.scriptURL).pathname==="/sw.js"){r.unregister()}}))}',
+          }}
+        />
+        <link rel="stylesheet" href={styles} />
+        <Meta />
+        <Links />
+        <GlobalStyle />
+        {/*
+         * Shopify Storefront Web Components are large third-party bundles.
+         * Do NOT load them in the document head: the header account button
+         * lazy-loads them on hover/focus/click instead, preserving the
+         * required script order (web-components.js before account.js).
+         */}
+      </head>
+      <body
+        style={
+          {
+            "--initial-topbar-height": `${
+              hasVisibleAnnouncement(topbarText) ? topbarHeight : 0
+            }px`,
+          } as CSSProperties
+        }
+        className="bg-background text-body antialiased"
+      >
+        <IconSprite />
+        {data ? (
+          // No `initialData`: the cart loads from `/api/cart` after hydration,
+          // so the SSR document stays anonymous and Oxygen can full-page cache
+          // it.
+          <CartProvider>
+            <CustomAnalytics />
+            <PageView />
+            <CartAnalytics />
+            <TooltipProvider disableHoverableContent>
+              <div
+                className="flex min-h-screen flex-col"
+                key={`${locale.language}-${locale.country}`}
+              >
+                <div className="">
+                  <a href="#mainContent" className="sr-only">
+                    Skip to content
+                  </a>
+                </div>
+                <ScrollingAnnouncement />
+                <Header />
+                <main id="mainContent" className="grow">
+                  {children}
+                </main>
+                <Footer />
+              </div>
+              {shouldShowNewsletterPopup && <NewsletterPopup />}
+            </TooltipProvider>
+          </CartProvider>
+        ) : (
+          children
+        )}
+        <PwaInstallHint />
+        <GlobalLoading />
+        <ScrollRestoration />
+        <Scripts />
+        {publicEnv?.PUBLIC_SHOPIFY_INBOX_SHOP_ID && (
+          <ShopifyInbox
+            shop={{
+              domain: publicEnv.PUBLIC_STORE_DOMAIN,
+              id: publicEnv.PUBLIC_SHOPIFY_INBOX_SHOP_ID,
+            }}
+            button={{
+              position: shopifyChatPosition,
+              verticalPosition: shopifyChatVerticalPosition,
+              color: shopifyChatColor,
+              style: shopifyChatStyle,
+              icon: shopifyChatIcon,
+              text: shopifyChatText,
+            }}
+          />
+        )}
+        {publicEnv?.PUBLIC_SHOPIFY_INBOX_SHOP_ID && shopifyChatCustomButton && (
+          <ShopifyInboxLauncher
+            position={shopifyChatPosition}
+            label={shopifyChatCustomButtonLabel}
+          />
+        )}
+      </body>
+    </html>
+  );
+});
+
+export default App;
+
+
+
