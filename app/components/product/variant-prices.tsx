@@ -1,0 +1,52 @@
+import type { MoneyV2 } from "@shopify/hydrogen/storefront-api-types";
+import { Money, useMoney } from "~/components/money";
+import type { ProductVariantFragment } from "~/graphql/fragments";
+import { cn } from "~/utils/cn";
+
+function CompareAtPrice({
+  data,
+  className,
+}: {
+  data: MoneyV2;
+  className?: string;
+}) {
+  // The market's own symbol placement (`12 €` in de-DE), never a prepended
+  // symbol glued to the amount.
+  const { withoutTrailingZeros } = useMoney(data);
+  return (
+    <span className={cn("strike text-(--color-compare-price-text)", className)}>
+      {withoutTrailingZeros}
+    </span>
+  );
+}
+
+export function VariantPrices({
+  variant,
+  showCompareAtPrice = true,
+  className,
+}: {
+  variant:
+    | ProductVariantFragment
+    | { price: Pick<MoneyV2, "amount" | "currencyCode"> };
+  showCompareAtPrice?: boolean;
+  className?: string;
+}) {
+  if (variant) {
+    const { price } = variant;
+    const compareAtPrice =
+      "compareAtPrice" in variant ? variant.compareAtPrice : undefined;
+    if (price) {
+      return (
+        <div className={cn("flex items-center gap-2", className)}>
+          <Money withoutTrailingZeros data={price} />
+          {showCompareAtPrice &&
+            compareAtPrice &&
+            compareAtPrice?.amount > price?.amount && (
+              <CompareAtPrice data={compareAtPrice as MoneyV2} />
+            )}
+        </div>
+      );
+    }
+  }
+  return null;
+}
