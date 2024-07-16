@@ -1,0 +1,232 @@
+import {
+  type WeaverseComponentLoaderArgs,
+  createSchema,
+  type WeaverseComponentProps,
+  type WeaverseProduct,
+} from "@weaverse/hydrogen/react-router";
+import type { CSSProperties } from "react";
+import { Icon } from "~/components/icon";
+import { PRODUCT_QUERY } from "~/graphql/queries";
+import { CACHE_DEFAULT } from "~/utils/cache";
+import { unwrapStorefront } from "~/utils/storefront";
+import { ProductPopup } from "./product-popup";
+
+export interface HotspotsItemData {
+  icon: "circle" | "plus" | "bag" | "tag";
+  iconSize: number;
+  offsetX: number;
+  offsetY: number;
+  product: WeaverseProduct;
+  popupWidth: number;
+  showPrice: boolean;
+  showViewDetailsLink: boolean;
+  viewDetailsLinkText: string;
+}
+
+interface HotspotsItemProps
+  extends
+    WeaverseComponentProps<Awaited<ReturnType<typeof loader>>>,
+    HotspotsItemData {}
+
+const ICONS = {
+  circle: "circle",
+  plus: "plus",
+  bag: "handbag",
+  tag: "tag",
+} as const;
+
+export default function HotspotsItem(props: HotspotsItemProps) {
+  const {
+    icon,
+    iconSize,
+    offsetX,
+    offsetY,
+    product,
+    popupWidth,
+    showPrice,
+    showViewDetailsLink,
+    viewDetailsLinkText,
+    children,
+    loaderData,
+    ...rest
+  } = props;
+  const iconName = ICONS[icon];
+
+  return (
+    <div
+      {...rest}
+      className="absolute -translate-x-1/2 -translate-y-1/2 hover:z-1"
+      style={
+        {
+          top: `${offsetY}%`,
+          left: `${offsetX}%`,
+          "--translate-x-ratio": offsetX > 50 ? 1 : -1,
+          "--translate-y-ratio": offsetY > 50 ? 1 : -1,
+          "--spot-size": `${iconSize + 16}px`,
+        } as CSSProperties
+      }
+    >
+      <div className="relative flex cursor-pointer">
+        <span
+          className="absolute inline-flex h-full w-full animate-ping rounded-md bg-gray-700 opacity-75"
+          style={{ animationDuration: "1500ms" }}
+        />
+        <span className="group relative inline-flex rounded-md bg-white p-2">
+          <Icon name={iconName} style={{ width: iconSize, height: iconSize }} />
+          <ProductPopup
+            product={loaderData?.product}
+            popupWidth={popupWidth}
+            offsetX={offsetX}
+            offsetY={offsetY}
+            showPrice={showPrice}
+            showViewDetailsLink={showViewDetailsLink}
+            viewDetailsLinkText={viewDetailsLinkText}
+          />
+        </span>
+      </div>
+    </div>
+  );
+}
+
+export const loader = async (
+  args: WeaverseComponentLoaderArgs<HotspotsItemData>,
+) => {
+  const { weaverse, data } = args;
+  const { storefront } = weaverse;
+  if (!data?.product) {
+    return null;
+  }
+  const productHandle = data.product.handle;
+  const result = await storefront.graphql(PRODUCT_QUERY, {
+    // `$country`/`$language` come from the storefront client's closure, which
+    // holds the Shopify provider enum. Never pass the market's public code
+    // here: bare `ZH` resolves to English.
+    variables: {
+      handle: productHandle,
+      selectedOptions: [],
+    },
+    cache: CACHE_DEFAULT,
+  });
+
+  return { product: unwrapStorefront(result).product };
+};
+
+export const schema = createSchema({
+  type: "hotspots--item",
+  title: "Hotspots item",
+  settings: [
+    {
+      group: "Icon",
+      inputs: [
+        {
+          type: "toggle-group",
+          name: "icon",
+          label: "Icon",
+          configs: {
+            options: [
+              {
+                label: "Circle",
+                value: "circle",
+                icon: "circle",
+              },
+              {
+                label: "Plus",
+                value: "plus",
+                icon: "plus",
+              },
+              {
+                label: "Bag",
+                value: "bag",
+                icon: "shopping-bag",
+              },
+              {
+                label: "Tag",
+                value: "tag",
+                icon: "tag",
+              },
+            ],
+          },
+          defaultValue: "plus",
+        },
+        {
+          type: "range",
+          name: "iconSize",
+          label: "Icon size",
+          configs: {
+            min: 16,
+            max: 32,
+            step: 2,
+            unit: "px",
+          },
+          defaultValue: 20,
+        },
+        {
+          type: "range",
+          name: "offsetX",
+          label: "Offset X",
+          configs: {
+            min: 0,
+            max: 100,
+            step: 1,
+            unit: "%",
+          },
+          defaultValue: 50,
+        },
+        {
+          type: "range",
+          name: "offsetY",
+          label: "Offset Y",
+          configs: {
+            min: 0,
+            max: 100,
+            step: 1,
+            unit: "%",
+          },
+          defaultValue: 50,
+        },
+      ],
+    },
+    {
+      group: "Product",
+      inputs: [
+        {
+          type: "product",
+          name: "product",
+          label: "Product",
+        },
+        {
+          type: "range",
+          name: "popupWidth",
+          label: "Popup width",
+          configs: {
+            min: 300,
+            max: 600,
+            step: 10,
+            unit: "px",
+          },
+          defaultValue: 350,
+          helpText: "For desktop devices only",
+        },
+        {
+          type: "switch",
+          name: "showPrice",
+          label: "Show price",
+          defaultValue: true,
+        },
+        {
+          type: "switch",
+          name: "showViewDetailsLink",
+          label: "Show view details link",
+          defaultValue: true,
+        },
+        {
+          type: "text",
+          name: "viewDetailsLinkText",
+          label: "View details link text",
+          defaultValue: "View full details",
+          condition: (data: HotspotsItemData) => data.showViewDetailsLink,
+        },
+      ],
+    },
+  ],
+});
