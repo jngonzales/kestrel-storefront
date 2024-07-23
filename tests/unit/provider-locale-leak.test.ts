@@ -1,0 +1,465 @@
+import { expect, test } from "@playwright/test";
+import type { AppContext } from "../../app/.server/context";
+import { getFeaturedProducts } from "../../app/utils/featured-products";
+import { createTestContext } from "../support/hydrogen-env";
+import { loadAppModule } from "../support/render-app";
+
+/**
+ * The two identities must stay apart at the boundary that actually issues
+ * requests, not merely in the object that holds them.
+ *
+ * The Weaverse client gets the market's public identity as its `locale`, for
+ * its Translation Manager key, while `weaverse.storefront` is the same client
+ * as `context.storefront`, carrying Shopify's provider language. Any query
+ * that copied the public `ZH` into its own variables would reach Shopify, and
+ * this store resolves bare `ZH` to English, so `/zh-cn` would serve an English
+ * catalogue underneath correct Chinese theme copy.
+ *
+ * Hydrogen 2026.10 fills `$country`/`$language` from the request context and
+ * its types reject them in `variables`, but an untyped caller (a section
+ * loader handed `weaverse.storefront`) can still pass one. These assert what leaves the process: the `language`
+ * in the Storefront POST body, and the `locale` in the translation URL.
+ */
+
+type Sent = { shopify: string[]; translation: string[] };
+
+/** Everything `run` sends, split by which provider it was addressed to. */
+async function sentBy(
+  pathPrefix: string,
+  run: (context: AppContext) => Promise<unknown>,
+): Promise<Sent> {
+  const shopify: string[] = [];
+  const translation: string[] = [];
+
+  // One recorder for the whole request: the Weaverse client keeps the `fetch`
+  // it was constructed with, so the context is built under the same stub that
+  // later observes the theme load.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.includes("/api/translation/static")) {
+      translation.push(new URL(url).searchParams.get("locale") ?? "");
+    }
+    const body = init?.body;
+    if (typeof body === "string" && body.includes("$language")) {
+      const { variables } = JSON.parse(body) as {
+        variables?: { language?: string };
+      };
+      if (variables?.language) {
+        shopify.push(variables.language);
+      }
+    }
+    return new Response(JSON.stringify({ data: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof globalThis.fetch;
+
+  try {
+    const context = await createTestContext(`https://shop.test${pathPrefix}/`);
+
+    // The stubbed response is empty, so a loader may well throw while shaping
+    // it. That happens strictly after the request went out, and the request is
+    // what is under test.
+    await run(context).catch(() => undefined);
+    await context.weaverse.loadThemeSettings();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  return { shopify, translation };
+}
+
+test("featured collections query Shopify with the provider language", async () => {
+  const { loader } = await loadAppModule<{
+    loader: (args: { data: unknown; weaverse: unknown }) => Promise<unknown>;
+  }>("sections/featured-collections/index.tsx");
+
+  const sent = await sentBy("/zh-hk", (context) =>
+    loader({
+      data: { collections: [{ id: "1" }] },
+      weaverse: context.weaverse,
+    }),
+  );
+
+  expect({
+    shopify: [...new Set(sent.shopify)],
+    translation: [...new Set(sent.translation)],
+  }).toEqual({ shopify: ["ZH_TW"], translation: ["zh-hk"] });
+});
+
+test("every featured-products selection mode queries with the provider language", async () => {
+  // The section picks one of three queries from `selectionMethod`, and a test
+  // that exercises one mode says nothing about the other two: adding an
+  // explicit `language` to the manual branch alone stays green against a
+  // collection-only test while every manual section on `/zh-cn` sends `ZH`.
+  //
+  // The `auto` case runs through the real section loader rather than calling
+  // its helper directly, because the section hands the helper
+  // `weaverse.storefront` rather than `context.storefront`, so only the real
+  // loader shows what that client sends.
+  const { loader } = await loadAppModule<{
+    loader: (args: { data: unknown; weaverse: unknown }) => Promise<unknown>;
+  }>("sections/featured-products/index.tsx");
+
+  const modes = [
+    {
+      mode: "collection",
+      data: { selectionMethod: "collection", collection: { handle: "all" } },
+    },
+    {
+      mode: "manual",
+      data: { selectionMethod: "manual", products: [{ id: "1" }] },
+    },
+    { mode: "auto", data: { selectionMethod: "auto" } },
+  ];
+
+  const sent: { mode: string; shopify: string[]; translation: string[] }[] = [];
+  for (const { mode, data } of modes) {
+    const observed = await sentBy("/zh-cn", (context) =>
+      loader({ data, weaverse: context.weaverse }),
+    );
+    sent.push({
+      mode,
+      shopify: [...new Set(observed.shopify)],
+      translation: [...new Set(observed.translation)],
+    });
+  }
+
+  expect(sent).toEqual([
+    { mode: "collection", shopify: ["ZH_CN"], translation: ["zh-cn"] },
+    { mode: "manual", shopify: ["ZH_CN"], translation: ["zh-cn"] },
+    { mode: "auto", shopify: ["ZH_CN"], translation: ["zh-cn"] },
+  ]);
+});
+
+test("the collection list route queries with the provider language", async () => {
+  const { loader } = await loadAppModule<{
+    loader: (args: { context: unknown; request: Request }) => Promise<unknown>;
+  }>("routes/collections/list.tsx");
+
+  const sent = await sentBy("/zh-tw", (context) =>
+    loader({
+      context,
+      // The route reads pagination off the request; without it the loader
+      // throws before querying and the test would assert on nothing.
+      request: new Request("https://shop.test/zh-tw/collections"),
+    }),
+  );
+
+  expect({
+    shopify: [...new Set(sent.shopify)],
+    translation: [...new Set(sent.translation)],
+  }).toEqual({ shopify: ["ZH_TW"], translation: ["zh-tw"] });
+});
+
+test("the featured-products helper keeps the provider language for any caller", async () => {
+  // The helper is shared, so it is checked with both clients a caller can hand
+  // it. Passing only `context.storefront` would hide an explicit variable
+  // added inside the helper, since that client already carries the enum.
+  const viaHydrogen = await sentBy("/zh-hk", (context) =>
+    getFeaturedProducts(context.storefront),
+  );
+  const viaWeaverse = await sentBy("/zh-hk", (context) =>
+    getFeaturedProducts(
+      context.weaverse.storefront as typeof context.storefront,
+    ),
+  );
+
+  expect({
+    viaHydrogen: [...new Set(viaHydrogen.shopify)],
+    viaWeaverse: [...new Set(viaWeaverse.shopify)],
+  }).toEqual({ viaHydrogen: ["ZH_TW"], viaWeaverse: ["ZH_TW"] });
+});
+
+test("every Weaverse section loader queries with the provider language", async () => {
+  // The four consumers above are the ones a review named. These are the rest
+  // of the same class — a loader reading `weaverse.storefront.locale` and
+  // copying it into its own query variables — so the guard covers the flow
+  // rather than the reported instances.
+  const cases = [
+    {
+      entry: "sections/single-product/loader.ts",
+      data: { product: { handle: "hoodie" } },
+    },
+    {
+      entry: "sections/hotspots/item.tsx",
+      data: { product: { handle: "hoodie" } },
+    },
+  ];
+
+  const sent: { entry: string; shopify: string[] }[] = [];
+  for (const { entry, data } of cases) {
+    const { loader } = await loadAppModule<{
+      loader: (args: { data: unknown; weaverse: unknown }) => Promise<unknown>;
+    }>(entry);
+
+    const observed = await sentBy("/zh-hk", (context) =>
+      loader({ data, weaverse: context.weaverse }),
+    );
+    sent.push({ entry, shopify: [...new Set(observed.shopify)] });
+  }
+
+  expect(sent).toEqual([
+    { entry: "sections/single-product/loader.ts", shopify: ["ZH_TW"] },
+    { entry: "sections/hotspots/item.tsx", shopify: ["ZH_TW"] },
+  ]);
+});
+
+test("no Shopify query ever collapses to the bare public language", async () => {
+  // `ZH` is a valid enum member that this store silently resolves to English,
+  // so a leak is invisible in a response and shows up only as an untranslated
+  // catalogue. Every Chinese market is checked, not just a spot case.
+  const { loader } = await loadAppModule<{
+    loader: (args: { data: unknown; weaverse: unknown }) => Promise<unknown>;
+  }>("sections/featured-collections/index.tsx");
+
+  const leaked: { market: string; language: string }[] = [];
+  for (const market of ["/zh-cn", "/zh-hk", "/zh-tw"]) {
+    const sent = await sentBy(market, (context) =>
+      loader({
+        data: { collections: [{ id: "1" }] },
+        weaverse: context.weaverse,
+      }),
+    );
+    for (const language of sent.shopify) {
+      if (language === "ZH") {
+        leaked.push({ market, language });
+      }
+    }
+  }
+
+  expect(leaked).toEqual([]);
+});
+
+test("the page route queries Shopify with the provider language", async () => {
+  // `regular-page` destructures its client off `context.weaverse`, so the
+  // earlier sweep — which grepped `weaverse.storefront.i18n` — did not see it.
+  // The alias makes no difference to what is sent: it must carry the provider
+  // language, never the public `ZH`.
+  const { loader } = await loadAppModule<{
+    loader: (args: {
+      request: Request;
+      params: Record<string, string>;
+      context: unknown;
+    }) => Promise<unknown>;
+  }>("routes/pages/regular-page.tsx");
+
+  const sent = await sentBy("/zh-cn", (context) =>
+    loader({
+      request: new Request("https://shop.test/zh-cn/pages/about"),
+      params: { pageHandle: "about" },
+      context,
+    }),
+  );
+
+  expect({
+    shopify: [...new Set(sent.shopify)],
+    translation: [...new Set(sent.translation)],
+  }).toEqual({ shopify: ["ZH_CN"], translation: ["zh-cn"] });
+});
+
+test("the article route queries Shopify with the provider language", async () => {
+  const { loader } = await loadAppModule<{
+    loader: (args: {
+      request: Request;
+      params: Record<string, string>;
+      context: unknown;
+    }) => Promise<unknown>;
+  }>("routes/blogs/article.tsx");
+
+  const sent = await sentBy("/zh-hk", (context) =>
+    loader({
+      request: new Request("https://shop.test/zh-hk/blogs/news/a-post"),
+      params: { blogHandle: "news", articleHandle: "a-post" },
+      context,
+    }),
+  );
+
+  expect({
+    shopify: [...new Set(sent.shopify)],
+    translation: [...new Set(sent.translation)],
+  }).toEqual({ shopify: ["ZH_TW"], translation: ["zh-hk"] });
+});
+
+test("page and article keep a non-Chinese market unchanged", async () => {
+  // The control: German has one identity, so a market where public and
+  // provider codes agree must be unaffected by the fix. Without this a loader
+  // that hardcoded `ZH_CN` would satisfy the tests above.
+  const page = await loadAppModule<{
+    loader: (args: {
+      request: Request;
+      params: Record<string, string>;
+      context: unknown;
+    }) => Promise<unknown>;
+  }>("routes/pages/regular-page.tsx");
+
+  const article = await loadAppModule<{
+    loader: (args: {
+      request: Request;
+      params: Record<string, string>;
+      context: unknown;
+    }) => Promise<unknown>;
+  }>("routes/blogs/article.tsx");
+
+  const sentPage = await sentBy("/de-de", (context) =>
+    page.loader({
+      request: new Request("https://shop.test/de-de/pages/about"),
+      params: { pageHandle: "about" },
+      context,
+    }),
+  );
+
+  const sentArticle = await sentBy("/de-de", (context) =>
+    article.loader({
+      request: new Request("https://shop.test/de-de/blogs/news/a-post"),
+      params: { blogHandle: "news", articleHandle: "a-post" },
+      context,
+    }),
+  );
+
+  expect({
+    page: [...new Set(sentPage.shopify)],
+    article: [...new Set(sentArticle.shopify)],
+    translation: [...new Set(sentPage.translation)],
+  }).toEqual({ page: ["DE"], article: ["DE"], translation: ["de-de"] });
+});
+
+test("Weaverse gets the public locale while Shopify keeps the provider language", async () => {
+  // The two identities stay apart: the storefront client Weaverse holds sends
+  // `ZH_TW`, while the Translation Manager is asked for the market's public
+  // `zh-hk`. If both agreed, one of the two providers would get the wrong code.
+  const sent = await sentBy("/zh-hk", async () => undefined);
+
+  expect({
+    shopify: [...new Set(sent.shopify)],
+    translation: [...new Set(sent.translation)],
+  }).toEqual({ shopify: [], translation: ["zh-hk"] });
+});
+
+test("shared product helpers never send the public language", async () => {
+  // Helpers are where a caller/callee mismatch hides: the helper looks correct
+  // beside a caller that hands it Hydrogen's client, and leaks beside one that
+  // hands it Weaverse's. Each is therefore exercised with the client its own
+  // callers actually pass.
+  const recommended = await loadAppModule<{
+    getRecommendedProducts: (
+      storefront: unknown,
+      productId: string,
+    ) => Promise<unknown>;
+  }>("routes/products/recommended-product.ts");
+
+  // Both clients, for the same reason the featured-products helper takes both:
+  // handing it only Hydrogen's client would pass even if the helper started
+  // copying `i18n.language` into its variables, because that client already
+  // carries the enum. Weaverse's client is the one that exposes the mistake.
+  const viaHydrogen = await sentBy("/zh-cn", (context) =>
+    recommended.getRecommendedProducts(
+      context.storefront,
+      "gid://shopify/Product/1",
+    ),
+  );
+  const viaWeaverse = await sentBy("/zh-cn", (context) =>
+    recommended.getRecommendedProducts(
+      context.weaverse.storefront,
+      "gid://shopify/Product/1",
+    ),
+  );
+
+  expect({
+    viaHydrogen: [...new Set(viaHydrogen.shopify)],
+    viaWeaverse: [...new Set(viaWeaverse.shopify)],
+  }).toEqual({ viaHydrogen: ["ZH_CN"], viaWeaverse: ["ZH_CN"] });
+});
+
+/** The query document and locale variables a run actually sent to Shopify. */
+async function shopifyQueryContract(
+  pathPrefix: string,
+  run: (context: AppContext) => Promise<unknown>,
+): Promise<{
+  declaresLocale: boolean;
+  appliesInContext: boolean;
+  language: string | null;
+  country: string | null;
+}> {
+  const realFetch = globalThis.fetch;
+  let sent: { query?: string; variables?: Record<string, string> } | null =
+    null;
+
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const body = init?.body;
+    if (typeof body === "string" && body.includes("query ") && !sent) {
+      sent = JSON.parse(body);
+    }
+    return new Response(JSON.stringify({ data: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof globalThis.fetch;
+
+  try {
+    const context = await createTestContext(
+      new Request(`https://shop.test${pathPrefix}/`),
+    );
+
+    await run(context).catch(() => undefined);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  const query = sent?.query ?? "";
+
+  return {
+    declaresLocale: query.includes("$country") && query.includes("$language"),
+    appliesInContext: query.includes("@inContext"),
+    language: sent?.variables?.language ?? null,
+    country: sent?.variables?.country ?? null,
+  };
+}
+
+test("the our-team section queries Shopify in the shopper's market", async () => {
+  // Hydrogen fills `$country`/`$language` from the storefront closure only for
+  // documents that declare them — `/\$language/.test(query)` in the installed
+  // client. A query that omits the declarations is not merely missing a
+  // variable: it reaches Shopify with no market at all and is answered in the
+  // shop's default language, so translated metaobject fields come back in the
+  // wrong language with a 200 and no error.
+  //
+  // Both halves are asserted. The variables alone would pass against a
+  // document that hardcoded them, and the declarations alone would pass
+  // against a document Hydrogen never filled.
+  const { loader } = await loadAppModule<{
+    loader: (args: { data: unknown; weaverse: unknown }) => Promise<unknown>;
+  }>("sections/our-team/index.tsx");
+
+  const run = (market: string) =>
+    shopifyQueryContract(market, (context) =>
+      loader({
+        data: { metaobject: { handle: "team_member" }, membersCount: 4 },
+        weaverse: context.weaverse,
+      }),
+    );
+
+  expect(await run("/zh-cn")).toEqual({
+    declaresLocale: true,
+    appliesInContext: true,
+    language: "ZH_CN",
+    country: "CN",
+  });
+
+  expect(await run("/zh-tw")).toEqual({
+    declaresLocale: true,
+    appliesInContext: true,
+    language: "ZH_TW",
+    country: "TW",
+  });
+
+  // A market whose public and provider codes agree, so a hardcoded Chinese
+  // enum would satisfy the two cases above and fail here.
+  expect(await run("/de-de")).toEqual({
+    declaresLocale: true,
+    appliesInContext: true,
+    language: "DE",
+    country: "DE",
+  });
+});
