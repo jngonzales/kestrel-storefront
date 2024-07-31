@@ -6,12 +6,9 @@
   <img src="public/images/storefront.png" alt="Kestrel storefront" width="900">
 </p>
 
-## Demo
+## Preview
 
-<video src="docs/assets/demo.mp4" poster="docs/assets/demo.jpg" controls muted playsinline preload="metadata" width="900"></video>
-
-If the player does not load, open [docs/assets/demo.mp4](docs/assets/demo.mp4).
-
+https://github.com/user-attachments/assets/43c6e9f5-e45b-495a-8cdf-db25f9997836
 ## What it is
 
 A production-shaped Shopify Hydrogen storefront. Routes, sections, cart, search, account and SEO are here; page composition and merchandising come from a Weaverse project, so merchants edit pages in a visual editor without a redeploy.
@@ -89,6 +86,6 @@ tests/unit/     Playwright unit specs
 
 ## Notes
 
-- Cart and checkout need a real store token; the demo token only reads the demo store
+- Cart and checkout need a real store token; the sample token only reads the sample store
 - Customer accounts need the Customer Account API client ID
 - The 3D and model-viewer sections rely on assets uploaded in the CMS project
